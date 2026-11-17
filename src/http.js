@@ -4,156 +4,128 @@ const https = require('https');
 const http  = require('http');
 const zlib  = require('zlib');
 
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const UA       = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const SEC_UA   = '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"';
 
-/**
- * Minimal cookie jar — just key=value, no expiry logic needed
- */
 class Jar {
-  constructor() { this._map = new Map(); }
-  
-  ingest(setCookieHeaders = []) {
-    for (const h of setCookieHeaders) {
+  constructor() { this._m = new Map(); }
+  ingest(arr = []) {
+    for (const h of arr) {
       const pair = h.split(';')[0].trim();
       const eq   = pair.indexOf('=');
       if (eq < 1) continue;
-      this._map.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+      this._m.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
     }
   }
-
-  header() {
-    return [...this._map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
-  }
-
-  set(k, v) { this._map.set(k, v); }
+  set(k, v) { this._m.set(k, v); }
+  header()  { return [...this._m.entries()].map(([k,v]) => `${k}=${v}`).join('; '); }
 }
 
 const jar = new Jar();
-// Pre-seed the cookie gamerxyt checks
 jar.set('xla', 's4t');
 jar.set('xyt', '1');
 
 /**
- * Raw promise-based GET — follows redirects manually so we can track
- * meta-refresh / JS window.location redirects too.
- *
- * @param {string} url
- * @param {object} opts
- * @param {string} [opts.referer]
- * @param {number} [opts.maxRedirects]
- * @returns {Promise<{body:string, finalUrl:string, status:number}>}
+ * Pure HTTP GET — follows ONLY HTTP 3xx redirects.
+ * NO JS redirect following. Ever. Those are ad-traps.
  */
 function rawGet(url, opts = {}) {
   return new Promise((resolve, reject) => {
-    const { referer = 'https://www.google.com/', maxRedirects = 12 } = opts;
-    let redirectsLeft = maxRedirects;
+    const { referer = 'https://www.google.com/', maxRedirects = 15 } = opts;
+    let hopsLeft = maxRedirects;
 
-    function doRequest(currentUrl) {
-      const parsed  = new URL(currentUrl);
+    function doReq(cur) {
+      let parsed;
+      try { parsed = new URL(cur); } catch(e) { return reject(new Error(`Bad URL: ${cur}`)); }
+
       const isHttps = parsed.protocol === 'https:';
       const lib     = isHttps ? https : http;
+
+      // ── Block ad/redirect domains we should never follow ──────────────
+      const blocked = ['bonuscaf.com','bonusca.com','winexch.com','acscdn.com',
+                       'cleverwebserver.com','cloudfront.net/aydfd'];
+      if (blocked.some(d => cur.includes(d))) {
+        return reject(new Error(`Blocked redirect to ad domain: ${cur}`));
+      }
 
       const reqOpts = {
         hostname: parsed.hostname,
         port    : parsed.port || (isHttps ? 443 : 80),
         path    : parsed.pathname + parsed.search,
         method  : 'GET',
+        timeout : 25000,
         headers : {
           'User-Agent'               : UA,
-          'Accept'                   : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept'                   : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
           'Accept-Language'          : 'en-US,en;q=0.9',
           'Accept-Encoding'          : 'gzip, deflate, br',
           'Connection'               : 'keep-alive',
           'Upgrade-Insecure-Requests': '1',
+          'Sec-CH-UA'                : SEC_UA,
+          'Sec-CH-UA-Mobile'         : '?0',
+          'Sec-CH-UA-Platform'       : '"Windows"',
           'Sec-Fetch-Dest'           : 'document',
           'Sec-Fetch-Mode'           : 'navigate',
-          'Sec-Fetch-Site'           : referer.includes(parsed.hostname) ? 'same-origin' : 'cross-site',
-          'Referer'                  : referer,
+          'Sec-Fetch-Site'           : referer && new URL(referer).hostname === parsed.hostname
+                                         ? 'same-origin' : 'cross-site',
+          'Sec-Fetch-User'           : '?1',
+          'Cache-Control'            : 'max-age=0',
+          'Referer'                  : referer || '',
           'Cookie'                   : jar.header(),
         },
-        timeout: 20000,
       };
 
       const req = lib.request(reqOpts, (res) => {
-        // Ingest cookies
+        // Ingest set-cookie
         const sc = res.headers['set-cookie'];
         if (sc) jar.ingest(Array.isArray(sc) ? sc : [sc]);
 
-        // HTTP redirects (301/302/303/307/308)
+        // HTTP 3xx
         const loc = res.headers['location'];
-        if ([301, 302, 303, 307, 308].includes(res.statusCode) && loc) {
-          if (redirectsLeft-- <= 0) return reject(new Error('Too many redirects'));
-          const next = loc.startsWith('http') ? loc : new URL(loc, currentUrl).href;
-          return doRequest(next);
+        if ([301,302,303,307,308].includes(res.statusCode) && loc) {
+          if (hopsLeft-- <= 0) return reject(new Error('Too many redirects'));
+          const next = loc.startsWith('http') ? loc : new URL(loc, cur).href;
+
+          // Block ad redirects even from HTTP 302
+          if (blocked.some(d => next.includes(d))) {
+            return reject(new Error(`gamerxyt blocked request (ad redirect): ${next}`));
+          }
+          return doReq(next);
         }
 
-        // Collect body
+        // Collect + decompress
         const chunks = [];
         let stream   = res;
-
-        const enc = res.headers['content-encoding'];
+        const enc    = res.headers['content-encoding'];
         if (enc === 'gzip')    stream = res.pipe(zlib.createGunzip());
         else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
         else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
 
-        stream.on('data',  (c) => chunks.push(c));
+        stream.on('data',  c => chunks.push(c));
         stream.on('error', reject);
-        stream.on('end',   () => {
-          resolve({
-            body    : Buffer.concat(chunks).toString('utf8'),
-            finalUrl: currentUrl,
-            status  : res.statusCode,
-          });
-        });
+        stream.on('end',   () => resolve({
+          body    : Buffer.concat(chunks).toString('utf8'),
+          finalUrl: cur,
+          status  : res.statusCode,
+        }));
       });
 
       req.on('error',   reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout: ${currentUrl}`)); });
+      req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout: ${cur}`)); });
       req.end();
     }
 
-    doRequest(url);
+    doReq(url);
   });
 }
 
-/**
- * GET with JS-redirect follow:
- * After HTTP redirects, scan the HTML body for:
- *   window.location[.href] = "..."
- *   <meta http-equiv="refresh" content="N; url=...">
- * and follow those too.
- */
+/** Simple delay */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** GET — HTTP redirects only, NO JS redirect following */
 async function get(url, opts = {}) {
-  let { body, finalUrl, status } = await rawGet(url, opts);
-
-  // Follow JS / meta-refresh redirects (up to 5 hops)
-  for (let i = 0; i < 5; i++) {
-    const jsRedir = extractJsRedirect(body);
-    if (!jsRedir) break;
-    const next = jsRedir.startsWith('http') ? jsRedir : new URL(jsRedir, finalUrl).href;
-    if (next === finalUrl) break; // same page, stop
-    ({ body, finalUrl, status } = await rawGet(next, { ...opts, referer: finalUrl }));
-  }
-
-  return { body, finalUrl, status };
+  if (opts.delay) await sleep(opts.delay);
+  return rawGet(url, opts);
 }
 
-function extractJsRedirect(html) {
-  // window.location.href = "..."  or  window.location = "..."
-  const jsMatch = html.match(
-    /window\.location(?:\.href)?\s*=\s*["'](?!#)(https?:\/\/[^"']+)["']/
-  );
-  if (jsMatch) return jsMatch[1];
-
-  // <meta http-equiv="refresh" content="N; url=...">
-  const metaMatch = html.match(
-    /content=["'][0-9]+\s*;\s*url=(https?:\/\/[^"'>]+)/i
-  );
-  if (metaMatch) return metaMatch[1];
-
-  return null;
-}
-
-module.exports = { get, jar };
+module.exports = { get, jar, sleep };
