@@ -1,18 +1,13 @@
-const cheerio = require('cheerio');
+'use strict';
 
 /**
  * Extract file ID from any HubCloud URL variant
- * Handles:
- *   hubcloud.pw/drive/ABC123
- *   hubcloud.cx/drive/ABC123
- *   hubcloud.mov/drive/ABC123
  */
 function extractFileId(inputUrl) {
   try {
-    const u = new URL(inputUrl);
-    // path: /drive/{id}  or  /d/{id}
+    const u     = new URL(inputUrl);
     const match = u.pathname.match(/\/(?:drive|d)\/([a-zA-Z0-9_-]+)/);
-    if (!match) throw new Error('Could not extract file ID from URL');
+    if (!match) throw new Error('Could not extract file ID');
     return { id: match[1], host: u.hostname };
   } catch (e) {
     throw new Error(`Invalid URL: ${e.message}`);
@@ -20,122 +15,128 @@ function extractFileId(inputUrl) {
 }
 
 /**
- * Parse Stage-1 page (hubcloud.mov/drive/{id})
- * Returns the gamerxyt token URL
+ * Stage-1 parse: get gamerxyt token URL + file metadata
+ * Works on HTML from hubcloud.mov/drive/{id}
  */
 function parseStage1(html) {
-  const $ = cheerio.load(html);
+  const meta = {};
 
-  // Primary: anchor with gamerxyt.com in href
-  let tokenUrl = $('a[href*="gamerxyt.com"]').first().attr('href');
+  // Filename from card-header
+  const hdrMatch = html.match(/<div[^>]*card-header[^>]*>\s*([^<\n]{3,200?}?)\s*<\/div>/i);
+  if (hdrMatch) meta.filename = hdrMatch[1].trim();
 
-  // Fallback: JS variable url = '...'
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  if (!meta.filename && titleMatch) meta.filename = titleMatch[1].trim();
+
+  // File size / type / date
+  const sizeMatch = html.match(/File Size[\s\S]{1,80}?<i[^>]*>([\d.\s]+[KMGT]B)<\/i>/i);
+  if (sizeMatch) meta.size = sizeMatch[1].trim();
+
+  const typeMatch = html.match(/File Type[\s\S]{1,80}?<i[^>]*>([^<]+)<\/i>/i);
+  if (typeMatch) meta.type = typeMatch[1].trim();
+
+  const dateMatch = html.match(/Share Date[\s\S]{1,80}?<i[^>]*>([^<]+)<\/i>/i);
+  if (dateMatch) meta.date = dateMatch[1].trim();
+
+  // ── Token URL extraction (try 4 patterns) ──────────────────────────────
+
+  // 1. Anchor href with gamerxyt
+  let tokenUrl = null;
+  const anchorMatch = html.match(/href=["'](https:\/\/gamerxyt\.com[^"']+)["']/i);
+  if (anchorMatch) tokenUrl = anchorMatch[1];
+
+  // 2. var url = '...'  (the JS auto-redirect variable)
   if (!tokenUrl) {
-    const scriptContent = $('script')
-      .map((_, el) => $(el).html())
-      .get()
-      .join('\n');
-
-    const urlMatch = scriptContent.match(/var\s+url\s*=\s*['"]([^'"]+)['"]/);
-    if (urlMatch) tokenUrl = urlMatch[1];
+    const jsVarMatch = html.match(/var\s+url\s*=\s*["'](https?:\/\/[^"']+)["']/);
+    if (jsVarMatch) tokenUrl = jsVarMatch[1];
   }
 
-  // Extract file metadata
-  const meta = {};
-  meta.filename =
-    $('div.card-header').first().text().trim() ||
-    $('title').text().trim();
+  // 3. window.location.href = '...' pointing to gamerxyt
+  if (!tokenUrl) {
+    const jsLocMatch = html.match(/window\.location(?:\.href)?\s*=\s*["'](https?:\/\/gamerxyt[^"']+)["']/);
+    if (jsLocMatch) tokenUrl = jsLocMatch[1];
+  }
 
-  $('li.list-group-item').each((_, el) => {
-    const text = $(el).text().trim();
-    if (text.includes('File Size'))
-      meta.size = $(el).find('i').text().trim();
-    if (text.includes('File Type'))
-      meta.type = $(el).find('i').text().trim();
-    if (text.includes('Share Date'))
-      meta.date = $(el).find('i').text().trim();
-  });
+  // 4. Any URL containing gamerxyt
+  if (!tokenUrl) {
+    const anyMatch = html.match(/(https:\/\/gamerxyt\.com\/[^\s"'<>]+)/i);
+    if (anyMatch) tokenUrl = anyMatch[1];
+  }
 
-  if (!tokenUrl) throw new Error('Could not locate token URL in Stage-1 page');
+  if (!tokenUrl) throw new Error('Token URL not found in Stage-1 HTML');
 
   return { tokenUrl, meta };
 }
 
 /**
- * Parse Stage-2 page (final download page after gamerxyt redirect)
- * Returns array of { label, url, server } objects
+ * Stage-2 parse: extract all download links from final page
  */
-function parseStage2(html, finalUrl) {
-  const $ = cheerio.load(html);
+function parseStage2(html) {
   const links = [];
+  const seen  = new Set();
 
-  const push = (label, url, server) => {
-    if (url && url.startsWith('http')) links.push({ label, url, server });
-  };
+  function push(label, url, server) {
+    if (!url || !url.startsWith('http') || seen.has(url)) return;
+    seen.add(url);
+    links.push({ label, url, server });
+  }
 
-  // FSLv2 Server  (id="s3")
-  push('FSLv2 Server', $('a#s3').attr('href'), 'fslv2');
+  // ── 1. FSLv2 (id="s3") ──────────────────────────────────────────────
+  const s3Match = html.match(/id=["']s3["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']s3["']/i);
+  if (s3Match) push('FSLv2 Server', s3Match[1] || s3Match[2], 'fslv2');
 
-  // FSL Server (id="fsl")
-  //  Note: the site patches this via inline JS; we grab the href attribute directly
-  //  then also attempt to extract the patched version from script
-  let fslUrl = $('a#fsl').attr('href') || '';
-  const scripts = $('script').map((_, el) => $(el).html()).get().join('\n');
-  const fslScriptMatch = scripts.match(/const\s+fsl\s*=\s*[^;]+;[\s\S]*?fsl\.href\s*=\s*([^;]+)/);
-  // just use the raw href if present
-  if (fslUrl && fslUrl.includes('r2.cloudflarestorage.com'))
-    push('FSL Server', fslUrl, 'fsl');
+  // ── 2. FSL Server (id="fsl") ─────────────────────────────────────────
+  const fslMatch = html.match(/id=["']fsl["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']fsl["']/i);
+  if (fslMatch) push('FSL Server', fslMatch[1] || fslMatch[2], 'fsl');
 
-  // 10Gbps Server (gpdl.hubcloud.mov)
-  $('a[href*="gpdl.hubcloud"]').each((_, el) => {
-    push('10Gbps Server', $(el).attr('href'), '10gbps');
-  });
+  // ── 3. R2 / S3 signed URLs anywhere ─────────────────────────────────
+  const r2Re = /href=["'](https:\/\/[a-z0-9]+\.r2\.cloudflarestorage\.com\/[^"']+)["']/gi;
+  let m;
+  while ((m = r2Re.exec(html)) !== null) {
+    push('Direct Server', m[1], 'r2');
+  }
 
-  // PixelDrain
-  $('a[id^="pxl"]').each((_, el) => {
-    push('PixelDrain Server', $(el).attr('href'), 'pixeldrain');
-  });
-  // also check script-patched pxl
-  const pxlMatch = scripts.match(/var\s+pxl\s*=\s*["']([^"']+)["']/);
-  if (pxlMatch) push('PixelDrain Server (patched)', pxlMatch[1], 'pixeldrain');
+  // ── 4. GPDL 10Gbps ───────────────────────────────────────────────────
+  const gpdlRe = /href=["'](https:\/\/gpdl\.hubcloud[^"']+)["']/gi;
+  while ((m = gpdlRe.exec(html)) !== null) {
+    push('10Gbps Server', m[1], '10gbps');
+  }
 
-  // Buzz / FuckingFast
-  $('a[href*="fuckingfast"]').each((_, el) => {
-    push('Buzz Server', $(el).attr('href'), 'buzz');
-  });
+  // ── 5. PixelDrain — static href ──────────────────────────────────────
+  const pxlHrefRe = /href=["'](https:\/\/pixeldrain[^"']+)["']/gi;
+  while ((m = pxlHrefRe.exec(html)) !== null) {
+    push('PixelDrain Server', m[1], 'pixeldrain');
+  }
+  // PixelDrain — JS patched: var pxl = "..."
+  const pxlJs = html.match(/var\s+pxl\s*=\s*["'](https?:\/\/[^"']+)["']/);
+  if (pxlJs) push('PixelDrain Server', pxlJs[1], 'pixeldrain');
 
-  // Telegram download
-  $('a[href*="hubcloud.mov/tg"]').each((_, el) => {
-    push('Telegram', $(el).attr('href'), 'telegram');
-  });
+  // ── 6. FuckingFast / Buzz ────────────────────────────────────────────
+  const ffRe = /href=["'](https:\/\/fuckingfast\.net\/[^"']+)["']/gi;
+  while ((m = ffRe.exec(html)) !== null) {
+    push('Buzz Server', m[1], 'buzz');
+  }
 
-  // Watch Online
-  const watchUrl = $('a#tgbtn').attr('href');
-  if (watchUrl) push('Watch Online (Stream)', watchUrl, 'stream');
+  // ── 7. Telegram download ─────────────────────────────────────────────
+  const tgRe = /href=["'](https:\/\/hubcloud\.[a-z]+\/tg\/go[^"']+)["']/gi;
+  while ((m = tgRe.exec(html)) !== null) {
+    push('Telegram Download', m[1], 'telegram');
+  }
 
-  // Generic catch-all: any big download buttons we may have missed
-  $('a.btn.btn-success, a.btn.btn-danger').each((_, el) => {
-    const href = $(el).attr('href') || '';
-    const text = $(el).text().trim();
-    if (
-      href.startsWith('http') &&
-      (href.includes('r2.cloudflarestorage') ||
-        href.includes('gpdl') ||
-        href.includes('pixeldrain') ||
-        href.includes('fuckingfast')) &&
-      !links.find((l) => l.url === href)
-    ) {
-      push(text || 'Unknown Server', href, 'other');
-    }
-  });
+  // ── 8. HBPlay watch-online ───────────────────────────────────────────
+  const hbRe = /href=["'](https:\/\/hbplay[^"']+)["']/gi;
+  while ((m = hbRe.exec(html)) !== null) {
+    push('Watch Online', m[1], 'stream');
+  }
 
-  // Deduplicate by URL
-  const seen = new Set();
-  return links.filter((l) => {
-    if (seen.has(l.url)) return false;
-    seen.add(l.url);
-    return true;
-  });
+  // ── 9. Generic btn-success / btn-danger fallback ──────────────────────
+  const btnRe = /class=["'][^"']*btn(?:-success|-danger)[^"']*["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*class=["'][^"']*btn(?:-success|-danger)[^"']*["']/gi;
+  while ((m = btnRe.exec(html)) !== null) {
+    const u = m[1] || m[2];
+    if (u && u.startsWith('http')) push('Server', u, 'other');
+  }
+
+  return links;
 }
 
 module.exports = { extractFileId, parseStage1, parseStage2 };
