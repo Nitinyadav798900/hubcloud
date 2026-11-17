@@ -1,65 +1,85 @@
-const { get } = require('./http');
+'use strict';
+
+const { get, jar } = require('./http');
 const { extractFileId, parseStage1, parseStage2 } = require('./parser');
+
+// All known HubCloud drive hosts (try in order)
+const DRIVE_HOSTS = [
+  'hubcloud.mov',
+  'hubcloud.cx',
+  'hubcloud.in',
+  'hubcloud.pw',
+  'hubcloud.fans',
+  'hubcloud.club',
+];
 
 /**
  * Full HubCloud bypass pipeline
- * @param {string} inputUrl - Any hubcloud drive URL
- * @returns {Promise<object>} Structured result with all download links
  */
 async function bypass(inputUrl) {
-  // ── Stage 0: Normalize URL ──────────────────────────────────────────────
   const { id } = extractFileId(inputUrl);
-  const driveUrl = `https://hubcloud.mov/drive/${id}`;
 
-  // ── Stage 1: Fetch drive page ───────────────────────────────────────────
-  const stage1 = await get(driveUrl, { Referer: 'https://hubcloud.mov/' });
+  // ── Stage 1: Fetch drive page (try hosts until one works) ─────────────
+  let stage1Html  = null;
+  let stage1Url   = null;
 
-  if (stage1.status === 404) throw new Error(`File not found: ${id}`);
-  if (!stage1.data) throw new Error('Empty response from drive page');
-
-  const { tokenUrl, meta } = parseStage1(stage1.data);
-
-  // ── Stage 2: Hit gamerxyt token endpoint ────────────────────────────────
-  //   This endpoint redirects (301/302) to the final download page
-  const stage2 = await get(tokenUrl, {
-    Referer: driveUrl,
-    'Sec-Fetch-Site': 'cross-site',
-  });
-
-  // The final URL after redirect is the actual download page
-  // If still on gamerxyt, follow manually
-  let finalHtml = stage2.data;
-  let finalUrl = stage2.finalUrl;
-
-  // Some variants redirect to hubcloud.mov/drive2/{token} style pages
-  if (finalUrl.includes('gamerxyt.com') && stage2.status === 200) {
-    // Extract meta-refresh or window.location from gamerxyt response
-    const redirMatch = finalHtml.match(
-      /(?:window\.location(?:\.href)?\s*=\s*|url=|content=["'][0-9]+;\s*url=)["']?(https?:\/\/[^"'\s>]+)/i
-    );
-    if (redirMatch) {
-      const hop = await get(redirMatch[1], { Referer: tokenUrl });
-      finalHtml = hop.data;
-      finalUrl = hop.finalUrl;
+  for (const host of DRIVE_HOSTS) {
+    const url = `https://${host}/drive/${id}`;
+    try {
+      const res = await get(url, { referer: 'https://www.google.com/' });
+      if (res.status === 200 && res.body.length > 500) {
+        stage1Html = res.body;
+        stage1Url  = res.finalUrl;
+        break;
+      }
+    } catch (_) {
+      // try next host
     }
   }
 
-  // ── Stage 3: Parse download links ───────────────────────────────────────
-  const servers = parseStage2(finalHtml, finalUrl);
+  if (!stage1Html) throw new Error(`File not found or all hosts down (id: ${id})`);
+
+  // ── Stage 2: Extract token URL ─────────────────────────────────────────
+  const { tokenUrl, meta } = parseStage1(stage1Html);
+
+  // Set referer to the page we just loaded
+  jar.set('xla', 's4t');
+  jar.set('xyt', '1');
+
+  // ── Stage 3: Hit gamerxyt token endpoint ──────────────────────────────
+  // This might 302 → hubcloud.mov/drive2/... OR return HTML with JS redirect
+  const stage2 = await get(tokenUrl, {
+    referer    : stage1Url,
+    maxRedirects: 15,
+  });
+
+  let finalHtml = stage2.body;
+  let finalUrl  = stage2.finalUrl;
+
+  // If we ended up back on a drive page or gamerxyt itself, something is wrong
+  if (finalUrl.includes('gamerxyt.com') && stage2.status !== 200) {
+    throw new Error('gamerxyt token rejected — URL may have expired');
+  }
+
+  // ── Stage 4: Parse all download links ─────────────────────────────────
+  const servers = parseStage2(finalHtml);
 
   if (servers.length === 0) {
+    // Debug dump — will appear in Vercel function logs
+    console.error('[bypass] Final URL:', finalUrl);
+    console.error('[bypass] HTML snippet:', finalHtml.slice(0, 2000));
     throw new Error(
-      'No download links found — token may have expired. Re-request the original URL.'
+      'No download links found — token expired. Use a fresh HubCloud URL.'
     );
   }
 
   return {
-    success: true,
-    file_id: id,
-    metadata: meta,
+    success     : true,
+    file_id     : id,
+    metadata    : meta,
     servers,
-    token_url: tokenUrl,
-    final_page: finalUrl,
+    token_url   : tokenUrl,
+    final_page  : finalUrl,
     extracted_at: new Date().toISOString(),
   };
 }
