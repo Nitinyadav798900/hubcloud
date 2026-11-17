@@ -3,61 +3,36 @@
 const express = require('express');
 const { bypass } = require('./src/bypass');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Middleware ──────────────────────────────────────────────────────────────
 app.use(express.json());
-app.use((req, res, next) => {
-  res.setHeader('X-Powered-By', 'hubcloud-bypass');
+app.use((_, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
 
-// ── Rate limit (simple in-memory, swap for redis in prod) ──────────────────
+// ── Rate limit (memory-based, fine for Vercel) ─────────────────────────
 const rateMap = new Map();
-app.use((req, res, next) => {
-  if (req.path !== '/hubcloud') return next();
-  const ip = req.ip;
+app.use('/hubcloud', (req, res, next) => {
+  const ip  = req.headers['x-forwarded-for']?.split(',')[0] || req.ip || 'unknown';
   const now = Date.now();
-  const entry = rateMap.get(ip) || { count: 0, start: now };
-  if (now - entry.start > 60_000) {
-    rateMap.set(ip, { count: 1, start: now });
-    return next();
-  }
-  entry.count++;
-  if (entry.count > 30) {
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded (30 req/min)' });
-  }
-  rateMap.set(ip, entry);
+  const rec = rateMap.get(ip) || { n: 0, t: now };
+  if (now - rec.t > 60_000) { rateMap.set(ip, { n: 1, t: now }); return next(); }
+  if (++rec.n > 30) return res.status(429).json({ success: false, error: 'Rate limit (30/min)' });
+  rateMap.set(ip, rec);
   next();
 });
 
-// ── Routes ──────────────────────────────────────────────────────────────────
-
-/**
- * GET /hubcloud?url={hubcloud_drive_url}
- *
- * Response:
- * {
- *   success: true,
- *   file_id: "hjbxwnwshhhqyu8",
- *   metadata: { filename, size, type, date },
- *   servers: [
- *     { label: "FSLv2 Server", url: "https://...", server: "fslv2" },
- *     { label: "FSL Server",   url: "https://...", server: "fsl"   },
- *     ...
- *   ],
- *   extracted_at: "2026-11-17T06:00:00.000Z"
- * }
- */
+// ── Main endpoint ───────────────────────────────────────────────────────
 app.get('/hubcloud', async (req, res) => {
   const { url } = req.query;
 
   if (!url) {
     return res.status(400).json({
       success: false,
-      error: 'Missing ?url= parameter',
+      error  : 'Missing ?url= parameter',
       example: '/hubcloud?url=https://hubcloud.pw/drive/hjbxwnwshhhqyu8',
     });
   }
@@ -66,27 +41,16 @@ app.get('/hubcloud', async (req, res) => {
     const result = await bypass(url);
     return res.json(result);
   } catch (err) {
-    const isUserError =
-      err.message.includes('Invalid URL') ||
-      err.message.includes('not found') ||
-      err.message.includes('expired');
-
-    return res.status(isUserError ? 400 : 502).json({
-      success: false,
-      error: err.message,
-      url,
-    });
+    console.error('[/hubcloud] error:', err.message);
+    const code = err.message.includes('not found') || err.message.includes('Invalid') ? 400 : 502;
+    return res.status(code).json({ success: false, error: err.message, url });
   }
 });
 
-// Health check
+// ── Health check ────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'up', ts: Date.now() }));
 
-// 404
-app.use((_, res) =>
-  res.status(404).json({ success: false, error: 'Route not found' })
-);
+// ── 404 ─────────────────────────────────────────────────────────────────
+app.use((_, res) => res.status(404).json({ success: false, error: 'Route not found' }));
 
-app.listen(PORT, () => {
-  console.log(`[hubcloud-bypass] listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`[hubcloud-bypass] :${PORT}`));
