@@ -1,9 +1,8 @@
 'use strict';
 
-const { get, jar } = require('./http');
+const { get, jar, sleep } = require('./http');
 const { extractFileId, parseStage1, parseStage2 } = require('./parser');
 
-// All known HubCloud drive hosts (try in order)
 const DRIVE_HOSTS = [
   'hubcloud.mov',
   'hubcloud.cx',
@@ -13,15 +12,12 @@ const DRIVE_HOSTS = [
   'hubcloud.club',
 ];
 
-/**
- * Full HubCloud bypass pipeline
- */
 async function bypass(inputUrl) {
   const { id } = extractFileId(inputUrl);
 
-  // ── Stage 1: Fetch drive page (try hosts until one works) ─────────────
-  let stage1Html  = null;
-  let stage1Url   = null;
+  // ── Stage 1: Fetch drive page ──────────────────────────────────────────
+  let stage1Html = null;
+  let stage1Url  = null;
 
   for (const host of DRIVE_HOSTS) {
     const url = `https://${host}/drive/${id}`;
@@ -30,48 +26,57 @@ async function bypass(inputUrl) {
       if (res.status === 200 && res.body.length > 500) {
         stage1Html = res.body;
         stage1Url  = res.finalUrl;
+        console.log(`[bypass] Stage1 OK from ${host}`);
         break;
       }
-    } catch (_) {
-      // try next host
+    } catch (e) {
+      console.warn(`[bypass] Host ${host} failed: ${e.message}`);
     }
   }
 
-  if (!stage1Html) throw new Error(`File not found or all hosts down (id: ${id})`);
+  if (!stage1Html) throw new Error(`File not found (id: ${id})`);
 
   // ── Stage 2: Extract token URL ─────────────────────────────────────────
   const { tokenUrl, meta } = parseStage1(stage1Html);
+  console.log(`[bypass] Token URL: ${tokenUrl}`);
 
-  // Set referer to the page we just loaded
+  // ── CRITICAL: seed cookies exactly like browser does ──────────────────
   jar.set('xla', 's4t');
   jar.set('xyt', '1');
 
-  // ── Stage 3: Hit gamerxyt token endpoint ──────────────────────────────
-  // This might 302 → hubcloud.mov/drive2/... OR return HTML with JS redirect
-  const stage2 = await get(tokenUrl, {
-    referer    : stage1Url,
-    maxRedirects: 15,
-  });
+  // ── CRITICAL: wait 2.5s — gamerxyt has a 2s timer before allowing ──────
+  // Without this delay, gamerxyt treats request as bot and bounces to ad
+  await sleep(2500);
 
-  let finalHtml = stage2.body;
-  let finalUrl  = stage2.finalUrl;
-
-  // If we ended up back on a drive page or gamerxyt itself, something is wrong
-  if (finalUrl.includes('gamerxyt.com') && stage2.status !== 200) {
-    throw new Error('gamerxyt token rejected — URL may have expired');
+  // ── Stage 3: Hit gamerxyt ─────────────────────────────────────────────
+  let finalHtml, finalUrl;
+  try {
+    const res = await get(tokenUrl, {
+      referer: stage1Url,  // must be hubcloud page
+    });
+    finalHtml = res.body;
+    finalUrl  = res.finalUrl;
+    console.log(`[bypass] Final URL: ${finalUrl}`);
+  } catch (e) {
+    // gamerxyt bounced to ad — token expired or bot detected
+    throw new Error(
+      `gamerxyt rejected the request: ${e.message}. ` +
+      `Use a fresh URL from HDHub4u.ms`
+    );
   }
 
-  // ── Stage 4: Parse all download links ─────────────────────────────────
+  // ── Stage 4: Parse download links ─────────────────────────────────────
   const servers = parseStage2(finalHtml);
 
   if (servers.length === 0) {
-    // Debug dump — will appear in Vercel function logs
     console.error('[bypass] Final URL:', finalUrl);
-    console.error('[bypass] HTML snippet:', finalHtml.slice(0, 2000));
+    console.error('[bypass] HTML snippet:', finalHtml.slice(0, 3000));
     throw new Error(
-      'No download links found — token expired. Use a fresh HubCloud URL.'
+      'No download links found. Token expired — get a fresh URL from HDHub4u.ms'
     );
   }
+
+  console.log(`[bypass] Found ${servers.length} servers`);
 
   return {
     success     : true,
